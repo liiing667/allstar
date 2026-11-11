@@ -17,10 +17,13 @@ package action
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 
 	"actionlint.kjanat.dev"
@@ -40,8 +43,12 @@ const (
 		"repos within the organization. This repo is failing to fully comply with organization " +
 		"policies, as explained below.\n\n```\n%s```\n\nSee the org-level %s policy configuration for details."
 
-	maxWorkflows                  = 50
 	repoSelectorExcludeDepthLimit = 3
+	workflowDirectoryPath         = ".github/workflows"
+	workflowDirPageSize           = 100
+	// maxWorkflows is retained for compatibility. Workflow discovery no
+	// longer truncates the workflow directory at this size.
+	maxWorkflows = 50
 
 	// Rule methods.
 	ruleMethodRequire = "require"
@@ -635,62 +642,49 @@ func listLanguagesReal(ctx context.Context, c *github.Client, owner, repo string
 // filter to workflows with all trigger events listed in on.
 // Docs: https://docs.github.com/en/rest/repos/contents#get-repository-content
 func listWorkflowsReal(ctx context.Context, c *github.Client, owner, repo string) ([]*workflowMetadata, error) {
-	// TODO add cacheable walk to workflows dir here.
-	// See pkg/config/contents.go for similar. The difference here is getting
-	// dir rather than file contents. Could be nice to modify config's
-	// implementation and make it public for use here.
-	_, workflowDirContents, resp, err := c.Repositories.GetContents(ctx, owner, repo,
-		".github/workflows", &github.RepositoryContentGetOptions{})
+	workflowDirContents, err := listWorkflowDirContents(ctx, c, owner, repo)
 	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			// No workflows dir should yield no workflows
-			return []*workflowMetadata{}, nil
-		}
-		return nil, fmt.Errorf("listing workflows in %s/%s: %w", owner, repo, err)
+		return nil, err
 	}
-	// Limit number of considered workflows to maxWorkflows
-	if len(workflowDirContents) > maxWorkflows {
-		workflowDirContents = workflowDirContents[:maxWorkflows]
-	}
+	// The API does not guarantee directory ordering. Sort by path so rule
+	// evaluation and failure reporting are deterministic.
+	sort.SliceStable(workflowDirContents, func(i, j int) bool {
+		return workflowContentPath(workflowDirContents[i]) < workflowContentPath(workflowDirContents[j])
+	})
 	// Get content for workflows
 	for _, wff := range workflowDirContents {
-		fc, _, _, err := c.Repositories.GetContents(ctx, owner, repo, wff.GetPath(), &github.RepositoryContentGetOptions{})
+		wfPath := workflowContentPath(wff)
+		if wfPath == "" {
+			return nil, fmt.Errorf("workflow directory entry in %s/%s is missing a path", owner, repo)
+		}
+		if wff.GetType() == "dir" {
+			continue
+		}
+		fc, _, _, err := c.Repositories.GetContents(ctx, owner, repo, wfPath, &github.RepositoryContentGetOptions{})
 		if err != nil {
-			return nil, fmt.Errorf("fetching workflow %s in %s/%s: %w", wff.GetPath(), owner, repo, err)
+			return nil, fmt.Errorf("fetching workflow %s in %s/%s: %w", wfPath, owner, repo, err)
 		}
 		if fc == nil {
-			// skip directories
-			continue
+			return nil, fmt.Errorf("workflow %s in %s/%s is not a file", wfPath, owner, repo)
 		}
 		content, err := fc.GetContent()
 		if err != nil {
-			return nil, fmt.Errorf("decoding workflow %s: %w", wff.GetPath(), err)
+			return nil, fmt.Errorf("decoding workflow %s in %s/%s: %w", wfPath, owner, repo, err)
 		}
 		wff.Content = &content
 	}
 	var workflows []*workflowMetadata
 	for _, wfc := range workflowDirContents {
-		if wfc.Name == nil {
-			// missing name?
-			log.Error().
-				Str("org", owner).
-				Str("repo", repo).
-				Str("area", polName).
-				Str("path", wfc.GetPath()).
-				Msg("Workflow file missing name field unexpectedly.")
+		if wfc.GetType() == "dir" {
 			continue
+		}
+		path := workflowContentPath(wfc)
+		if wfc.GetName() == "" {
+			return nil, fmt.Errorf("workflow directory entry %q in %s/%s is missing a name", path, owner, repo)
 		}
 		sc, err := wfc.GetContent()
 		if err != nil {
-			log.Error().
-				Str("org", owner).
-				Str("repo", repo).
-				Str("area", polName).
-				Str("path", wfc.GetPath()).
-				Str("downloadURL", wfc.GetDownloadURL()).
-				Err(err).
-				Msg("Unexpected error while getting workflow file content. Skipping.")
-			continue
+			return nil, fmt.Errorf("getting content for workflow %s in %s/%s: %w", path, owner, repo, err)
 		}
 		bc := []byte(sc)
 		wf, errs := actionlint.Parse(bc)
@@ -699,16 +693,20 @@ func listWorkflowsReal(ctx context.Context, c *github.Client, owner, repo string
 			for _, err := range errs {
 				parseErrors = append(parseErrors, fmt.Errorf("actionlist.Parse error: %w", err))
 			}
+			if len(parseErrors) == 0 {
+				parseErrors = append(parseErrors, errors.New("actionlint.Parse returned no workflow"))
+			}
 			log.Warn().
 				Str("org", owner).
 				Str("repo", repo).
 				Str("area", polName).
-				Str("path", wfc.GetPath()).
+				Str("path", path).
 				Errs("errors", parseErrors).
 				Msg("Errors while parsing workflow file content.")
-		}
-		if wf == nil {
-			continue
+			// A partially parsed workflow can hide Actions from the policy.
+			// Fail closed instead of silently reducing the scan surface.
+			return nil, fmt.Errorf("parsing workflow %s in %s/%s: %w", path, owner, repo,
+				errors.Join(parseErrors...))
 		}
 		workflows = append(workflows, &workflowMetadata{
 			filename: wfc.GetName(),
@@ -716,6 +714,77 @@ func listWorkflowsReal(ctx context.Context, c *github.Client, owner, repo string
 		})
 	}
 	return workflows, nil
+}
+
+// listWorkflowDirContents returns every entry in the workflow directory,
+// following GitHub API pagination. A missing workflow directory yields no
+// entries.
+func listWorkflowDirContents(ctx context.Context, c *github.Client, owner, repo string) (
+	[]*github.RepositoryContent, error,
+) {
+	opts := &github.ListOptions{
+		Page:    1,
+		PerPage: workflowDirPageSize,
+	}
+	var contents []*github.RepositoryContent
+	seenPages := map[int]struct{}{}
+
+	for {
+		if _, seen := seenPages[opts.Page]; seen {
+			return nil, fmt.Errorf("listing workflows in %s/%s: pagination repeated page %d", owner, repo, opts.Page)
+		}
+		seenPages[opts.Page] = struct{}{}
+
+		u := fmt.Sprintf("repos/%s/%s/contents/%s", owner, repo, workflowDirectoryPath)
+		params := url.Values{}
+		params.Set("page", strconv.Itoa(opts.Page))
+		params.Set("per_page", strconv.Itoa(opts.PerPage))
+		u += "?" + params.Encode()
+
+		req, err := c.NewRequest("GET", u, nil)
+		if err != nil {
+			return nil, fmt.Errorf("listing workflows in %s/%s: %w", owner, repo, err)
+		}
+		var raw json.RawMessage
+		resp, err := c.Do(ctx, req, &raw)
+		if err != nil {
+			if resp != nil && resp.StatusCode == http.StatusNotFound && opts.Page == 1 {
+				// No workflows dir should yield no workflows.
+				return []*github.RepositoryContent{}, nil
+			}
+			return nil, fmt.Errorf("listing workflows in %s/%s: %w", owner, repo, err)
+		}
+
+		var page []*github.RepositoryContent
+		if err := json.Unmarshal(raw, &page); err != nil {
+			return nil, fmt.Errorf("decoding workflow directory page %d in %s/%s: %w", opts.Page, owner, repo, err)
+		}
+		contents = append(contents, page...)
+
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		if resp.NextPage <= opts.Page {
+			return nil, fmt.Errorf("listing workflows in %s/%s: pagination next page %d did not advance past %d",
+				owner, repo, resp.NextPage, opts.Page)
+		}
+		opts.Page = resp.NextPage
+	}
+
+	return contents, nil
+}
+
+func workflowContentPath(wfc *github.RepositoryContent) string {
+	if wfc == nil {
+		return ""
+	}
+	if p := wfc.GetPath(); p != "" {
+		return p
+	}
+	if n := wfc.GetName(); n != "" {
+		return workflowDirectoryPath + "/" + n
+	}
+	return ""
 }
 
 // listTagsReal uses the GitHub API to list tags for a repo.
